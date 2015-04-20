@@ -216,7 +216,26 @@ class Podio {
     else {
       self::$headers['Accept'] = '*/*';
     }
-
+	
+	## Code specifically designed to work around a memory leak issue caused by requesting multiple or large files
+	## Pass in custom parameters
+	if ( isset( $options['new_file'] ) && ! empty( $options['new_file'] ) ) {
+		## No execution time limit on the script
+		set_time_limit( 0 );
+		## Generate a random file name with extra entropy
+		$random_file_name = '/tmp/' . uniqid( 'podio_', true );
+		## Open the random temp file for writing
+		$fp = fopen( $random_file_name, 'w+' );
+		## Setup cURL to follow redirects to prevent an error on 302
+		curl_setopt( self::$ch, CURLOPT_FOLLOWLOCATION, true);
+		## Set a new timeout appropriate for this operation
+		curl_setopt( self::$ch, CURLOPT_TIMEOUT, 50 );
+		## Reject the header from the cURL response
+		curl_setopt( self::$ch, CURLOPT_HEADER, false );
+		## Instruct cURL to write the response to file, utilising disk IO and thus releasing memory
+		curl_setopt( self::$ch, CURLOPT_FILE, $fp );
+	}
+	
     curl_setopt(self::$ch, CURLOPT_HTTPHEADER, self::curl_headers());
     curl_setopt(self::$ch, CURLOPT_URL, empty($options['file_download']) ? self::$url.$url : $url);
 
@@ -233,6 +252,21 @@ class Podio {
       self::log_request($method, $url, $encoded_attributes, $response, $curl_info);
     }
 
+	## Closing section of the new code above
+	if ( isset( $options['new_file'] ) && ! empty( $options['new_file'] ) ) {
+		## Close the file's stream
+		fclose( $fp );
+		## In the event that a bad response code is still received...
+		if ( ( $response->status < 200 || $response->status > 299 ) ) {
+			## Purge the randomly generated temp file
+			shell_exec( 'rm ' . $random_file_name );
+		## Otherwise, if we're all good...
+		} else {
+			## Move the random file into the correct location
+			shell_exec( 'mv ' . $random_file_name . ' "' . $options['new_file'] . '"' );
+		}
+	}
+	
     switch ($response->status) {
       case 200 :
       case 201 :
