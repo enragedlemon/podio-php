@@ -61,6 +61,7 @@ class Podio {
   }
 
   public static function authenticate($grant_type, $attributes) {
+	$_SESSION['podio_grant'] = array( 'grant_type' => $grant_type, 'attributes' => $attributes );
     $data = array();
     $auth_type = array('type' => $grant_type);
 
@@ -239,13 +240,27 @@ class Podio {
     curl_setopt(self::$ch, CURLOPT_HTTPHEADER, self::curl_headers());
     curl_setopt(self::$ch, CURLOPT_URL, empty($options['file_download']) ? self::$url.$url : $url);
 
-    $response = new PodioResponse();
-    $raw_response = curl_exec(self::$ch);
-    $raw_headers_size = curl_getinfo(self::$ch, CURLINFO_HEADER_SIZE);
-    $response->body = substr($raw_response, $raw_headers_size);
-    $response->status = curl_getinfo(self::$ch, CURLINFO_HTTP_CODE);
-    $response->headers = self::parse_headers(substr($raw_response, 0, $raw_headers_size));
-    self::$last_response = $response;
+    do {
+		$response = new PodioResponse();
+		$raw_response = curl_exec(self::$ch);
+		$response->status = curl_getinfo(self::$ch, CURLINFO_HTTP_CODE);
+		if ( $response->status == 420 ) {
+			if ( function_exists( 'rate_limit_exceeded' ) ) {
+				rate_limit_exceeded();
+				if (isset(self::$oauth) && !empty(self::$oauth->access_token) && !(isset($options['oauth_request']) && $options['oauth_request'] == true)) {
+					$token = self::$oauth->access_token;
+					self::$headers['Authorization'] = "OAuth2 {$token}";
+				}
+			} else {
+				sleep( 300 );
+			}
+		}
+	} while ( $response->status == 420 );
+	
+	$raw_headers_size = curl_getinfo(self::$ch, CURLINFO_HEADER_SIZE);
+	$response->body = substr($raw_response, $raw_headers_size);
+	$response->headers = self::parse_headers(substr($raw_response, 0, $raw_headers_size));
+	self::$last_response = $response;
 
     if (!isset($options['oauth_request'])) {
       $curl_info = curl_getinfo(self::$ch, CURLINFO_HEADER_OUT);
