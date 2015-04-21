@@ -93,7 +93,7 @@ class Podio {
     }
 
     $request_data = array_merge($data, array('client_id' => self::$client_id, 'client_secret' => self::$client_secret));
-    if ($response = self::request(self::POST, '/oauth/token', $request_data, array('oauth_request' => true))) {
+    if ($response = self::request(self::POST, '/oauth/token', $request_data, array('oauth_request' => true), true )) {
       $body = $response->json_body();
       self::$oauth = new PodioOAuth($body['access_token'], $body['refresh_token'], $body['expires_in'], $body['ref']);
 
@@ -129,7 +129,7 @@ class Podio {
     return self::$oauth && self::$oauth->access_token;
   }
 
-  public static function request($method, $url, $attributes = array(), $options = array()) {
+  public static function request($method, $url, $attributes = array(), $options = array(), $is_auth = false ) {
     if (!self::$ch) {
       throw new Exception('Client has not been setup with client id and client secret.');
     }
@@ -177,7 +177,7 @@ class Podio {
         curl_setopt(self::$ch, CURLOPT_CUSTOMREQUEST, self::POST);
         if (!empty($options['upload'])) {
           curl_setopt(self::$ch, CURLOPT_POST, TRUE);
-          curl_setopt(self::$ch, CURLOPT_POSTFIELDS, $attributes);
+          @curl_setopt(self::$ch, CURLOPT_POSTFIELDS, $attributes);
           self::$headers['Content-type'] = 'multipart/form-data';
         }
         elseif (empty($options['oauth_request'])) {
@@ -217,7 +217,7 @@ class Podio {
     else {
       self::$headers['Accept'] = '*/*';
     }
-	
+    
 	## Code specifically designed to work around a memory leak issue caused by requesting multiple or large files
 	## Pass in custom parameters
 	if ( isset( $options['new_file'] ) && ! empty( $options['new_file'] ) ) {
@@ -237,19 +237,29 @@ class Podio {
 		curl_setopt( self::$ch, CURLOPT_FILE, $fp );
 	}
 	
-    curl_setopt(self::$ch, CURLOPT_HTTPHEADER, self::curl_headers());
-    curl_setopt(self::$ch, CURLOPT_URL, empty($options['file_download']) ? self::$url.$url : $url);
-
-    do {
+	curl_setopt(self::$ch, CURLOPT_HTTPHEADER, self::curl_headers());
+	curl_setopt(self::$ch, CURLOPT_URL, empty($options['file_download']) ? self::$url.$url : $url);
+	
+	do {
 		$response = new PodioResponse();
 		$raw_response = curl_exec(self::$ch);
 		$response->status = curl_getinfo(self::$ch, CURLINFO_HTTP_CODE);
 		if ( $response->status == 420 ) {
-			if ( function_exists( 'rate_limit_exceeded' ) ) {
-				rate_limit_exceeded();
-				if (isset(self::$oauth) && !empty(self::$oauth->access_token) && !(isset($options['oauth_request']) && $options['oauth_request'] == true)) {
-					$token = self::$oauth->access_token;
-					self::$headers['Authorization'] = "OAuth2 {$token}";
+			if ( function_exists( 'new_api_key' ) ) {
+				self::clear_authentication();
+				new_api_key();
+				if ( $is_auth ) {
+					$_SESSION['podio_grant'] = null;
+					$attributes['client_id'] = self::$client_id = $_SESSION['new_client_id'];
+					$attributes['client_secret'] = self::$client_secret = $_SESSION['new_client_secret'];
+					$new_attributes = self::encode_attributes( $attributes );
+					@curl_setopt( self::$ch, CURLOPT_POSTFIELDS, $new_attributes );
+				} else {
+					if ( isset( $_SESSION['podio_grant'] ) && is_array( $_SESSION['podio_grant'] ) ) self::authenticate( $_SESSION['podio_grant']['grant_type'], $_SESSION['podio_grant']['attributes'] );
+					if (isset(self::$oauth) && !empty(self::$oauth->access_token) && !(isset($options['oauth_request']) && $options['oauth_request'] == true)) {
+						$token = self::$oauth->access_token;
+						self::$headers['Authorization'] = "OAuth2 {$token}";
+					}
 				}
 			} else {
 				sleep( 300 );
@@ -261,12 +271,12 @@ class Podio {
 	$response->body = substr($raw_response, $raw_headers_size);
 	$response->headers = self::parse_headers(substr($raw_response, 0, $raw_headers_size));
 	self::$last_response = $response;
-
-    if (!isset($options['oauth_request'])) {
-      $curl_info = curl_getinfo(self::$ch, CURLINFO_HEADER_OUT);
-      self::log_request($method, $url, $encoded_attributes, $response, $curl_info);
-    }
-
+	
+	if (!isset($options['oauth_request'])) {
+		$curl_info = curl_getinfo(self::$ch, CURLINFO_HEADER_OUT);
+		self::log_request($method, $url, $encoded_attributes, $response, $curl_info);
+	}
+	
 	## Closing section of the new code above
 	if ( isset( $options['new_file'] ) && ! empty( $options['new_file'] ) ) {
 		## Close the file's stream
@@ -281,7 +291,7 @@ class Podio {
 			shell_exec( 'mv ' . $random_file_name . ' "' . $options['new_file'] . '"' );
 		}
 	}
-	
+		
     switch ($response->status) {
       case 200 :
       case 201 :
