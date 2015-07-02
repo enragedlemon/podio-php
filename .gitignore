@@ -6,3 +6,6 @@ log/*
 Gemfile.lock
 .bundle
 _site
+.idea
+lib/Podio.php
+lib/Podio.php
