@@ -3,8 +3,9 @@
 class Podio {
   public static $oauth, $debug, $logger, $session_manager, $last_response, $auth_type;
   protected static $url, $client_id, $client_secret, $secret, $ch, $headers;
+  private static $stdout;
 
-  const VERSION = '4.0.3';
+  const VERSION = '4.1.0';
 
   const GET = 'GET';
   const POST = 'POST';
@@ -24,11 +25,16 @@ class Podio {
       'Accept' => 'application/json',
     );
     curl_setopt(self::$ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt(self::$ch, CURLOPT_SSL_VERIFYPEER, false);
-    curl_setopt(self::$ch, CURLOPT_SSL_VERIFYHOST, false);
+    curl_setopt(self::$ch, CURLOPT_SSL_VERIFYPEER, 1);
+    curl_setopt(self::$ch, CURLOPT_SSL_VERIFYHOST, 2);
     curl_setopt(self::$ch, CURLOPT_USERAGENT, 'Podio PHP Client/'.self::VERSION);
     curl_setopt(self::$ch, CURLOPT_HEADER, true);
     curl_setopt(self::$ch, CURLINFO_HEADER_OUT, true);
+
+    //Update CA root certificates - require: https://github.com/Kdyby/CurlCaBundle
+    if(class_exists('\\Kdyby\\CurlCaBundle\\CertificateHelper')) {
+      \Kdyby\CurlCaBundle\CertificateHelper::setCurlCaInfo(self::$ch);
+    }
 
     if ($options && !empty($options['curl_options'])) {
       curl_setopt_array(self::$ch, $options['curl_options']);
@@ -129,7 +135,7 @@ class Podio {
     return self::$oauth && self::$oauth->access_token;
   }
 
-  public static function request($method, $url, $attributes = array(), $options = array(), $is_auth = false ) {
+  public static function request($method, $url, $attributes = array(), $options = array(), $is_auth = false) {
     if (!self::$ch) {
       throw new Exception('Client has not been setup with client id and client secret.');
     }
@@ -177,7 +183,8 @@ class Podio {
         curl_setopt(self::$ch, CURLOPT_CUSTOMREQUEST, self::POST);
         if (!empty($options['upload'])) {
           curl_setopt(self::$ch, CURLOPT_POST, TRUE);
-          @curl_setopt(self::$ch, CURLOPT_POSTFIELDS, $attributes);
+          curl_setopt(self::$ch, CURLOPT_SAFE_UPLOAD, FALSE);
+          curl_setopt(self::$ch, CURLOPT_POSTFIELDS, $attributes);
           self::$headers['Content-type'] = 'multipart/form-data';
         }
         elseif (empty($options['oauth_request'])) {
@@ -217,33 +224,40 @@ class Podio {
     else {
       self::$headers['Accept'] = '*/*';
     }
-    
-	## Code specifically designed to work around a memory leak issue caused by requesting multiple or large files
-	## Pass in custom parameters
-	if ( isset( $options['new_file'] ) && ! empty( $options['new_file'] ) ) {
-		## No execution time limit on the script
-		set_time_limit( 0 );
-		## Generate a random file name with extra entropy
-		$random_file_name = '/tmp/' . uniqid( 'podio_', true );
-		## Open the random temp file for writing
-		$fp = fopen( $random_file_name, 'w+' );
-		## Setup cURL to follow redirects to prevent an error on 302
-		curl_setopt( self::$ch, CURLOPT_FOLLOWLOCATION, true);
-		## Set a new timeout appropriate for this operation
-		curl_setopt( self::$ch, CURLOPT_TIMEOUT, 50 );
-		## Reject the header from the cURL response
-		curl_setopt( self::$ch, CURLOPT_HEADER, false );
-		## Instruct cURL to write the response to file, utilising disk IO and thus releasing memory
-		curl_setopt( self::$ch, CURLOPT_FILE, $fp );
-	}
-	
-	curl_setopt(self::$ch, CURLOPT_HTTPHEADER, self::curl_headers());
-	curl_setopt(self::$ch, CURLOPT_URL, empty($options['file_download']) ? self::$url.$url : $url);
+
+    curl_setopt(self::$ch, CURLOPT_HTTPHEADER, self::curl_headers());
+    curl_setopt(self::$ch, CURLOPT_URL, empty($options['file_download']) ? self::$url.$url : $url);
 	
 	do {
 		$response = new PodioResponse();
-		$raw_response = curl_exec(self::$ch);
-		$response->status = curl_getinfo(self::$ch, CURLINFO_HTTP_CODE);
+		if(isset($options['return_raw_as_resource_only']) && $options['return_raw_as_resource_only'] == true) {
+			$result_handle = fopen('php://temp', 'w');
+			curl_setopt(self::$ch, CURLOPT_FILE, $result_handle);
+			curl_exec(self::$ch);
+			if(isset(self::$stdout) && is_resource(self::$stdout)) {
+				fclose(self::$stdout);
+			}
+			self::$stdout = fopen('php://stdout','w');
+			curl_setopt(self::$ch, CURLOPT_FILE, self::$stdout);
+			curl_setopt(self::$ch, CURLOPT_RETURNTRANSFER, true);
+			$raw_headers_size = curl_getinfo(self::$ch, CURLINFO_HEADER_SIZE);
+
+			fseek($result_handle, 0);
+			$response->status = curl_getinfo(self::$ch, CURLINFO_HTTP_CODE);
+			if ( $response->status != 420 ) {
+				$response->headers = self::parse_headers(fread($result_handle, $raw_headers_size));
+				self::$last_response = $response;
+				return $result_handle;
+			}
+		} else {
+			$raw_response = curl_exec( self::$ch );
+			if ( $raw_response === false ) {
+				throw new PodioConnectionError( 'Connection to Podio API failed: [' . curl_errno(self::$ch) . '] ' . curl_error( self::$ch ), curl_errno( self::$ch ) );
+			}
+			$raw_headers_size = curl_getinfo( self::$ch, CURLINFO_HEADER_SIZE );
+			$response->status = curl_getinfo( self::$ch, CURLINFO_HTTP_CODE );
+		}
+		
 		if ( $response->status == 420 ) {
 			if ( function_exists( 'new_api_key' ) ) {
 				self::clear_authentication();
@@ -267,31 +281,15 @@ class Podio {
 		}
 	} while ( $response->status == 420 );
 	
-	$raw_headers_size = curl_getinfo(self::$ch, CURLINFO_HEADER_SIZE);
-	$response->body = substr($raw_response, $raw_headers_size);
-	$response->headers = self::parse_headers(substr($raw_response, 0, $raw_headers_size));
-	self::$last_response = $response;
-	
-	if (!isset($options['oauth_request'])) {
-		$curl_info = curl_getinfo(self::$ch, CURLINFO_HEADER_OUT);
-		self::log_request($method, $url, $encoded_attributes, $response, $curl_info);
-	}
-	
-	## Closing section of the new code above
-	if ( isset( $options['new_file'] ) && ! empty( $options['new_file'] ) ) {
-		## Close the file's stream
-		fclose( $fp );
-		## In the event that a bad response code is still received...
-		if ( ( $response->status < 200 || $response->status > 299 ) ) {
-			## Purge the randomly generated temp file
-			shell_exec( 'rm ' . $random_file_name );
-		## Otherwise, if we're all good...
-		} else {
-			## Move the random file into the correct location
-			shell_exec( 'mv ' . $random_file_name . ' "' . $options['new_file'] . '"' );
-		}
-	}
-		
+    $response->body = substr($raw_response, $raw_headers_size);
+    $response->headers = self::parse_headers(substr($raw_response, 0, $raw_headers_size));
+    self::$last_response = $response;
+
+    if (!isset($options['oauth_request'])) {
+      $curl_info = curl_getinfo(self::$ch, CURLINFO_HEADER_OUT);
+      self::log_request($method, $url, $encoded_attributes, $response, $curl_info);
+    }
+
     switch ($response->status) {
       case 200 :
       case 201 :
